@@ -18,6 +18,7 @@ package managed
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"strings"
 	"time"
@@ -89,6 +90,30 @@ const (
 
 	reasonReconciliationPaused event.Reason = "ReconciliationPaused"
 )
+
+// RetryAfterError is returned by a reconciler when it is unable to complete
+// the actions, and the reconciler should retry after the specified duration.
+type RetryAfterError struct {
+	retryAfter time.Duration
+}
+
+// NewRetryAfterError creates a new ErrRetryAfter with the given retry-after duration.
+func NewRetryAfterError(retryAfter time.Duration) RetryAfterError {
+	return RetryAfterError{retryAfter: retryAfter}
+}
+
+// DefaultRetryAfter is the default retry-after duration for ErrRetryAfter.
+const DefaultRetryAfter = 30 * time.Second
+
+// Error implements the error interface.
+func (e RetryAfterError) Error() string {
+	return fmt.Sprintf("retry after %v", e.retryAfter)
+}
+
+// RetryAfter returns the duration after which the reconciler should retry.
+func (e RetryAfterError) RetryAfter() time.Duration {
+	return e.retryAfter
+}
 
 // ControllerName returns the recommended name for controllers that use this
 // package to reconcile a particular kind of managed resource.
@@ -320,15 +345,27 @@ type ExternalClient interface {
 	// external resource does not exist. Create implementations may update
 	// managed resource annotations, and those updates will be persisted.
 	// All other updates will be discarded.
+	//
+	// This can return RetryAfterError to indicate that the resource cannot
+	// be created at this time, and that the controller should retry after
+	// the given duration.
 	Create(ctx context.Context, mg resource.Managed) (ExternalCreation, error)
 
 	// Update the external resource represented by the supplied Managed
 	// resource, if necessary. Called unless Observe reports that the
 	// associated external resource is up to date.
+	//
+	// This can return RetryAfterError to indicate that the resource cannot
+	// be updated at this time, and that the controller should retry after
+	// the given duration.
 	Update(ctx context.Context, mg resource.Managed) (ExternalUpdate, error)
 
 	// Delete the external resource upon deletion of its associated Managed
 	// resource. Called when the managed resource has been deleted.
+	//
+	// This can return RetryAfterError to indicate that the resource cannot
+	// be deleted at this time, and that the controller should retry after
+	// the given duration.
 	Delete(ctx context.Context, mg resource.Managed) error
 }
 
@@ -947,7 +984,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		log = log.WithValues("deletion-timestamp", managed.GetDeletionTimestamp())
 
 		if observation.ResourceExists && policy.ShouldDelete() {
-			if err := external.Delete(externalCtx, managed); err != nil {
+			err := external.Delete(externalCtx, managed)
+			var retryAfterErr RetryAfterError
+			if errors.As(err, &retryAfterErr) {
+				log.Debug("External resource cannot be deleted now", "requeue-after", time.Now().Add(retryAfterErr.RetryAfter()))
+				return reconcile.Result{RequeueAfter: retryAfterErr.RetryAfter()}, nil
+			}
+			if err != nil {
 				// We'll hit this condition if we can't delete our external
 				// resource, for example if our provider credentials don't have
 				// access to delete it. If this is the first time we encounter
@@ -1051,6 +1094,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 		}
 
 		creation, err := external.Create(externalCtx, managed)
+		var retryAfterErr RetryAfterError
+		if errors.As(err, &retryAfterErr) {
+			log.Debug("External resource cannot be created now", "requeue-after", time.Now().Add(retryAfterErr.RetryAfter()))
+			return reconcile.Result{RequeueAfter: retryAfterErr.RetryAfter()}, nil
+		}
 		if err != nil {
 			// We'll hit this condition if we can't create our external
 			// resource, for example if our provider credentials don't have
@@ -1181,6 +1229,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (resu
 	}
 
 	update, err := external.Update(externalCtx, managed)
+	var retryAfterErr RetryAfterError
+	if errors.As(err, &retryAfterErr) {
+		log.Debug("External resource cannot be updated now", "requeue-after", time.Now().Add(retryAfterErr.RetryAfter()))
+		return reconcile.Result{RequeueAfter: retryAfterErr.RetryAfter()}, nil
+	}
 	if err != nil {
 		// We'll hit this condition if we can't update our external resource,
 		// for example if our provider credentials don't have access to update
